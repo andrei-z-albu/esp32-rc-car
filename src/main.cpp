@@ -25,6 +25,10 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_I2C_ADDRESS);
 #define I2C_SDA 21 // Standard I2C pins for ESP32-WROOM
 #define I2C_SCL 22 // Standard I2C pins for ESP32-WROOM
 
+// Battery monitoring
+#define BATTERY_PIN 34 // ADC1_CH6 - good for battery monitoring (input only)
+#define BATTERY_ADC_CHANNEL ADC1_CHANNEL_6
+
 // Motor pins
 // Left motor
 constexpr int PWM_L = 18;
@@ -65,6 +69,23 @@ constexpr int ENC_R_B = 27;  // Swapped from 14 to 27
 // Global variables
 bool servoInitialized = false;
 bool isControllerConnected = false;
+
+// Connection monitoring
+unsigned long lastControllerDataTime = 0;
+unsigned long connectionTimeoutMs = 2000;  // 2 seconds timeout
+unsigned long lastReconnectAttempt = 0;
+unsigned long reconnectIntervalMs = 5000;  // Try reconnect every 5 seconds
+bool connectionLost = false;
+bool motorsStoppedDueToConnection = false;
+
+// Battery monitoring
+float batteryVoltage = 0.0f;
+int batteryPercentage = 0;
+unsigned long lastBatteryRead = 0;
+const unsigned long batteryReadInterval = 1000; // Read battery every 1 second
+const float batteryMaxVoltage = 8.8f; // 2S LiPo fully charged (4.4V per cell when fresh)
+const float batteryMinVoltage = 6.4f; // 2S LiPo empty (3.2V per cell)
+const float voltageDividerRatio = 4.0f; // 4:1 voltage divider (2x10kΩ in series + 1x10kΩ to ground)
 
 // Motor control variables
 volatile long leftEncoderCount = 0;
@@ -136,6 +157,34 @@ const uint16_t r1Button = 0x0020; // Right shoulder button
 // Top image dimensions
 #define TOP_IMAGE_WIDTH 73
 #define TOP_IMAGE_HEIGHT 30
+
+// Bluetooth icon dimensions (8x8 pixels)
+#define BT_ICON_WIDTH 8
+#define BT_ICON_HEIGHT 8
+
+// Bluetooth icon bitmap (8x8 pixels)
+static const unsigned char PROGMEM bt_connected_icon[] = {
+  0x18, // 00011000
+  0x28, // 00101000  
+  0x6C, // 01101100
+  0x38, // 00111000
+  0x38, // 00111000
+  0x6C, // 01101100
+  0x28, // 00101000
+  0x18  // 00011000
+};
+
+// Bluetooth disconnected icon (8x8 pixels with X)
+static const unsigned char PROGMEM bt_disconnected_icon[] = {
+  0x99, // 10011001
+  0x5A, // 01011010
+  0x3C, // 00111100
+  0x18, // 00011000
+  0x18, // 00011000
+  0x3C, // 00111100
+  0x5A, // 01011010
+  0x99  // 10011001
+};
 
 // Top bitmap image (73x30 pixels)
 static const unsigned char PROGMEM top_image[] = {
@@ -712,7 +761,7 @@ void displayTripComputer() {
     
     switch (currentPage) {
         case TOTAL_ODOMETRY:
-            title = "Total Odometry";
+            title = "ODO";
             distanceText = formatDistance(totalDistance);
             break;
             
@@ -734,13 +783,27 @@ void displayTripComputer() {
             break;
     }
     
-    // Display title
+    // Display compact Bluetooth status icon in top left corner
+    if (connectionLost || !isControllerConnected) {
+        display.drawBitmap(2, 1, bt_disconnected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (isControllerConnected) {
+        display.drawBitmap(2, 1, bt_connected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
+    }
+    
+    // Display battery percentage in top right corner
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
+    String batteryText = String(batteryPercentage) + "%";
     int16_t x1, y1;
     uint16_t w, h;
+    display.getTextBounds(batteryText, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(SCREEN_WIDTH - w - 2, 2); // 2px from right edge
+    display.println(batteryText);
+    
+    // Display title on the same top row, centered
+    display.setTextColor(SSD1306_WHITE);
     display.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
-    display.setCursor((SCREEN_WIDTH - w) / 2, 2);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 2); // Back to original top position
     display.println(title);
     
     // Display main distance reading (large font)
@@ -752,11 +815,11 @@ void displayTripComputer() {
     int startX = (SCREEN_WIDTH - textWidth) / 2;
     if (startX < 0) startX = 0;
     
-    // Position distance in middle area
+    // Position distance in middle area (back to original position)
     display.setCursor(startX, 20);
     display.println(distanceText);
     
-    // Display footer if present
+    // Display footer if present (back to original position)
     if (footer.length() > 0) {
         display.setTextSize(1);
         display.getTextBounds(footer, 0, 0, &x1, &y1, &w, &h);
@@ -944,6 +1007,42 @@ void displayTopImage() {
     display.drawBitmap(x, 0, top_image, TOP_IMAGE_WIDTH, TOP_IMAGE_HEIGHT, SSD1306_WHITE);
 }
 
+void displayStartupScreen() {
+    display.clearDisplay();
+    
+    // Display the top image (bitmap)
+    displayTopImage();
+    
+    // Display compact Bluetooth status icon in top left corner
+    if (connectionLost || !isControllerConnected) {
+        display.drawBitmap(2, 1, bt_disconnected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (isControllerConnected) {
+        display.drawBitmap(2, 1, bt_connected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
+    }
+    
+    // Display battery percentage in top right corner
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    String batteryText = String(batteryPercentage) + "%";
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(batteryText, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(SCREEN_WIDTH - w - 2, 1);
+    display.print(batteryText);
+    
+    // Display total odometry below the bitmap
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    String odoText = "ODO: " + formatDistance(totalDistance);
+    display.getTextBounds(odoText, 0, 0, &x1, &y1, &w, &h);
+    int x = (SCREEN_WIDTH - w) / 2;
+    int y = TOP_IMAGE_HEIGHT + 8; // Add some spacing below the bitmap
+    display.setCursor(x, y);
+    display.print(odoText);
+    
+    display.display();
+}
+
 void displayButtonIcon(const unsigned char* icon) {
     display.clearDisplay();
     // Always display the top image first
@@ -1014,15 +1113,111 @@ void onConnectedController(ControllerPtr ctl) {
 void onDisconnectedController(ControllerPtr ctl) {
     Serial.printf("CALLBACK: Controller disconnected!\n");
     isControllerConnected = false;
+    connectionLost = true;
+    
+    // Immediate safety stop
+    setMotorSpeed(0, 0);
+    leftRPMTarget = 0;
+    rightRPMTarget = 0;
+    leftPIDIntegral = 0;
+    rightPIDIntegral = 0;
+    motorsStoppedDueToConnection = true;
+    Serial.println("SAFETY: Motors stopped due to connection loss");
+    
     // Remove the controller from myControllers
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == ctl) {
             myControllers[i] = nullptr;
-            display.clearDisplay();
-            displayTopImage();
-            printCenteredText("Connect Controller");
             break;
         }
+    }
+    
+    // Update display to show startup screen
+    displayStartupScreen();
+}
+
+void readBatteryLevel() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastBatteryRead >= batteryReadInterval) {
+        // Read ADC value (0-4095 for 12-bit ADC)
+        int adcValue = analogRead(BATTERY_PIN);
+        
+        // Convert to voltage (ESP32 ADC reference is 3.3V)
+        float adcVoltage = (adcValue / 4095.0f) * 3.3f;
+        
+        // Apply voltage divider ratio to get actual battery voltage
+        batteryVoltage = adcVoltage * voltageDividerRatio;
+        
+        // Calculate percentage (constrain to 0-100%)
+        batteryPercentage = (int)constrain(
+            ((batteryVoltage - batteryMinVoltage) / (batteryMaxVoltage - batteryMinVoltage)) * 100.0f,
+            0.0f, 100.0f
+        );
+        
+        lastBatteryRead = currentTime;
+        
+        // Debug output every 5 seconds for troubleshooting
+        static unsigned long lastBatteryDebug = 0;
+        if (currentTime - lastBatteryDebug >= 5000) {
+            Serial.printf("=== BATTERY DEBUG ===\n");
+            Serial.printf("Raw ADC: %d (0-4095 scale)\n", adcValue);
+            Serial.printf("ADC Voltage: %.3fV (ESP32 pin voltage)\n", adcVoltage);
+            Serial.printf("Battery Voltage: %.3fV (actual battery)\n", batteryVoltage);
+            Serial.printf("Voltage Range: %.1fV-%.1fV\n", batteryMinVoltage, batteryMaxVoltage);
+            Serial.printf("Battery Percentage: %d%%\n", batteryPercentage);
+            Serial.printf("Divider Ratio: %.1f:1\n", voltageDividerRatio);
+            Serial.printf("====================\n");
+            lastBatteryDebug = currentTime;
+        }
+    }
+}
+
+void checkConnectionHealth() {
+    unsigned long currentTime = millis();
+    
+    // Check if we have an active controller
+    bool hasActiveController = false;
+    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+        if (myControllers[i] != nullptr && myControllers[i]->isConnected()) {
+            hasActiveController = true;
+            break;
+        }
+    }
+    
+    // Update connection status
+    if (hasActiveController) {
+        if (connectionLost) {
+            // Reconnection detected
+            Serial.println("Connection restored!");
+            connectionLost = false;
+            motorsStoppedDueToConnection = false;
+            isControllerConnected = true;
+        }
+        lastControllerDataTime = currentTime;
+    } else {
+        // No active controller
+        if (isControllerConnected && !connectionLost) {
+            // Connection just lost
+            Serial.println("Connection health check: Controller lost");
+            connectionLost = true;
+            isControllerConnected = false;
+            
+            // Safety stop
+            setMotorSpeed(0, 0);
+            leftRPMTarget = 0;
+            rightRPMTarget = 0;
+            leftPIDIntegral = 0;
+            rightPIDIntegral = 0;
+            motorsStoppedDueToConnection = true;
+            Serial.println("SAFETY: Motors stopped due to connection timeout");
+        }
+    }
+    
+    // Attempt reconnection if needed
+    if (connectionLost && (currentTime - lastReconnectAttempt > reconnectIntervalMs)) {
+        Serial.println("Attempting reconnection...");
+        BP32.forgetBluetoothKeys(); // Clear old connections
+        lastReconnectAttempt = currentTime;
     }
 }
 
@@ -1142,6 +1337,34 @@ void processGamepad(ControllerPtr ctl) {
 
     // Handle trip computer navigation first (d-pad left/right/down)
     handleTripComputerNavigation(currentDPad);
+    
+    // Battery diagnostics - press UP on d-pad for detailed battery info
+    static bool upPressed = false;
+    if ((currentDPad & upButton) && !upPressed) {
+        upPressed = true;
+        Serial.printf("\n=== BATTERY DIAGNOSTIC REPORT ===\n");
+        int rawADC = analogRead(BATTERY_PIN);
+        float pinVoltage = (rawADC / 4095.0f) * 3.3f;
+        float calculatedBatteryV = pinVoltage * voltageDividerRatio;
+        
+        Serial.printf("Raw ADC Reading: %d\n", rawADC);
+        Serial.printf("ESP32 Pin Voltage: %.3fV\n", pinVoltage);
+        Serial.printf("Calculated Battery Voltage: %.3fV\n", calculatedBatteryV);
+        Serial.printf("Expected Pin Voltage for 8.4V battery: %.3fV\n", 8.4f / voltageDividerRatio);
+        Serial.printf("Expected Pin Voltage for 7.4V battery: %.3fV\n", 7.4f / voltageDividerRatio);
+        Serial.printf("Expected Pin Voltage for 6.4V battery: %.3fV\n", 6.4f / voltageDividerRatio);
+        
+        // Check if voltage divider is connected
+        if (rawADC < 100) {
+            Serial.printf("WARNING: Very low ADC reading - voltage divider may not be connected!\n");
+        } else if (rawADC > 3000) {
+            Serial.printf("WARNING: Very high ADC reading - check voltage divider ratio!\n");
+        }
+        
+        Serial.printf("================================\n\n");
+    } else if (!(currentDPad & upButton)) {
+        upPressed = false;
+    }
 
     // Debug trigger values
     static unsigned long lastTriggerDebug = 0;
@@ -1295,22 +1518,42 @@ void processGamepad(ControllerPtr ctl) {
         updateMotorControl(currentThrottle, currentBrake);
     }
     
-    // Show trip computer if controller is connected, otherwise show bitmap
+    // Show trip computer if controller is connected, otherwise show startup screen
     if (isControllerConnected) {
         displayOdometry(); // This calls display.display() internally
     } else {
-        display.clearDisplay();
-        displayTopImage();
-        display.display();
+        displayStartupScreen(); // This calls display.display() internally
     }
 }
 
 void processControllers() {
+    // First, check connection health and handle reconnections
+    checkConnectionHealth();
+    
+    // Read battery level
+    readBatteryLevel();
+    
+    bool dataProcessed = false;
     for (auto controller : myControllers) {
         if (controller && controller->isConnected() && controller->hasData()) {
             if (controller->isGamepad()) {
                 processGamepad(controller);
+                dataProcessed = true;
+                lastControllerDataTime = millis(); // Update last data time
             }
+        }
+    }
+    
+    // Safety check: if connection is lost, ensure motors are stopped
+    if (connectionLost || !isControllerConnected) {
+        if (!motorsStoppedDueToConnection) {
+            setMotorSpeed(0, 0);
+            leftRPMTarget = 0;
+            rightRPMTarget = 0;
+            leftPIDIntegral = 0;
+            rightPIDIntegral = 0;
+            motorsStoppedDueToConnection = true;
+            Serial.println("SAFETY: Motors stopped - no controller connection");
         }
     }
 }
@@ -1344,6 +1587,11 @@ void setup() {
     // Ensure motors are stopped
     setMotorSpeed(0, 0);
     Serial.println("Motors initialized");
+    
+    // Initialize ADC for battery monitoring
+    analogReadResolution(12); // 12-bit resolution (0-4095)
+    analogSetAttenuation(ADC_11db); // Allow reading up to ~3.3V
+    Serial.println("ADC initialized for battery monitoring");
 
     // Initialize I2C
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -1374,26 +1622,7 @@ void setup() {
     // center the servo
     setServoAngle(SERVO_CENTER);
     
-    // Initialize OLED
-    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
-        Serial.println("SSD1306 init failed");
-    } else {
-        Serial.println("Display initialized on I2C (SDA:21, SCL:22)");
-        display.clearDisplay();
-        displayTopImage();
-        printCenteredText("Connect Controller");
-    }
-
-    // Initialize Bluepad32
-    BP32.setup(&onConnectedController, &onDisconnectedController);
-    BP32.forgetBluetoothKeys();
-    BP32.enableVirtualDevice(false);
-    
-    const uint8_t* addr = BP32.localBdAddress();
-    Serial.printf("BD Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-    
-    // Initialize NVS for odometry
+    // Initialize NVS for odometry BEFORE display initialization
     if (!odomPrefs.begin("odom", false)) { // false means don't erase old data
         Serial.println("NVS prefs failed to initialize");
     } else {
@@ -1410,6 +1639,33 @@ void setup() {
         Serial.printf("Loaded odometry - Total: %.2f m, Trip1: %.2f m, Trip2: %.2f m\n", 
                      totalDistance, trip1Distance, trip2Distance);
     }
+    
+    // Initialize OLED
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
+        Serial.println("SSD1306 init failed");
+    } else {
+        Serial.println("Display initialized on I2C (SDA:21, SCL:22)");
+        // Force initial battery reading by resetting the timer
+        lastBatteryRead = 0;
+        // Read battery level for initial display - force multiple reads for stability
+        for (int i = 0; i < 5; i++) {
+            // Force reading by setting lastBatteryRead to allow immediate reading
+            lastBatteryRead = millis() - batteryReadInterval - 1;
+            readBatteryLevel();
+            delay(50); // Longer delay for ADC settling
+        }
+        Serial.printf("Initial battery reading: %.2fV (%d%%)\n", batteryVoltage, batteryPercentage);
+        displayStartupScreen();
+    }
+
+    // Initialize Bluepad32
+    BP32.setup(&onConnectedController, &onDisconnectedController);
+    BP32.forgetBluetoothKeys();
+    BP32.enableVirtualDevice(false);
+    
+    const uint8_t* addr = BP32.localBdAddress();
+    Serial.printf("BD Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
     Serial.println("Setup complete");
 }

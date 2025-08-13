@@ -60,6 +60,25 @@ This project implements a remote-controlled car using ESP32 with the following f
 - **Protection**: Double-constrained to 30°-150° maximum range
 - **Issue**: Original 0°-180° range caused servo stalls at steering extremes
 
+## Connection Management & Safety
+- **Connection Monitoring**: Real-time health check every loop cycle
+- **Safety Stop**: Automatic motor shutdown when connection lost (within 2 seconds)
+- **Auto-Reconnection**: Attempts reconnection every 5 seconds when disconnected
+- **Visual Feedback**: Bluetooth icons show connection status (top left corner)
+- **Range**: ~8-10 meters typical Bluetooth range
+- **Recovery**: Automatic reconnection when controller comes back in range
+- **No Manual Restart**: No need to power cycle robot or controller for reconnection
+
+## Battery Monitoring
+- **Battery**: Conrad Energy 20C 3700mAh 7.4V LiPo (2S configuration)
+- **ADC Pin**: GPIO 34 (ADC1_CH6) for battery voltage measurement
+- **Voltage Range**: 6.4V (empty) to 8.4V (full) for 2S LiPo
+- **Voltage Divider**: 4:1 ratio using 3x 10kΩ resistors (2x in series + 1x to ground)
+- **Percentage Display**: Real-time battery % shown in top right corner
+- **Update Rate**: Readings every 1 second with debug output every 10 seconds
+- **12-bit ADC**: High resolution voltage measurement (0-4095 scale)
+- **20C Rating**: 74A continuous discharge capability (3.7Ah × 20C)
+
 ## Build Commands
 ```bash
 # Initialize PlatformIO project
