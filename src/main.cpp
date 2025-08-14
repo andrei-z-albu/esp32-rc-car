@@ -29,6 +29,12 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_I2C_ADDRESS);
 #define BATTERY_PIN 34 // ADC1_CH6 - good for battery monitoring (input only)
 #define BATTERY_ADC_CHANNEL ADC1_CHANNEL_6
 
+// LED lighting system - 4-pin independent control
+#define LEFT_HEADLIGHT_PIN 15  // Left headlights (2x white LEDs)
+#define RIGHT_HEADLIGHT_PIN 4  // Right headlights (2x white LEDs) 
+#define LEFT_TAILLIGHT_PIN 33  // Left tail lights (2x red LEDs) - GPIO 35 is INPUT-ONLY!
+#define RIGHT_TAILLIGHT_PIN 32 // Right tail lights (2x red LEDs)
+
 // Motor pins
 // Left motor
 constexpr int PWM_L = 18;
@@ -86,6 +92,30 @@ const unsigned long batteryReadInterval = 1000; // Read battery every 1 second
 const float batteryMaxVoltage = 8.8f; // 2S LiPo fully charged (4.4V per cell when fresh)
 const float batteryMinVoltage = 6.4f; // 2S LiPo empty (3.2V per cell)
 const float voltageDividerRatio = 4.0f; // 4:1 voltage divider (2x10kΩ in series + 1x10kΩ to ground)
+
+// LED lighting system - independent control
+bool lightsOn = false;
+bool leftHeadlightOn = false;
+bool rightHeadlightOn = false;
+bool leftTaillightOn = false;
+bool rightTaillightOn = false;
+
+// Flashing effects
+bool isFlashing = false;
+unsigned long flashStartTime = 0;
+unsigned long lastFlashTime = 0;
+const unsigned long flashDuration = 2000; // Flash for 2 seconds
+const unsigned long flashInterval = 200; // Flash every 200ms (5Hz)
+
+// Turn signal effects
+bool leftTurnSignal = false;
+bool rightTurnSignal = false;
+unsigned long lastTurnSignalTime = 0;
+const unsigned long turnSignalInterval = 500; // Blink every 500ms (2Hz)
+
+// Brake light effects
+bool brakeActive = false;
+const int BRAKE_THRESHOLD = 50; // Minimum brake input to activate brake lights
 
 // Motor control variables
 volatile long leftEncoderCount = 0;
@@ -184,6 +214,54 @@ static const unsigned char PROGMEM bt_disconnected_icon[] = {
   0x3C, // 00111100
   0x5A, // 01011010
   0x99  // 10011001
+};
+
+// LED light icon (8x8 pixels) - light bulb
+#define LED_ICON_WIDTH 8
+#define LED_ICON_HEIGHT 8
+static const unsigned char PROGMEM led_on_icon[] = {
+  0x3C, // 00111100
+  0x66, // 01100110
+  0x66, // 01100110
+  0x66, // 01100110
+  0x3C, // 00111100
+  0x18, // 00011000
+  0x3C, // 00111100
+  0x18  // 00011000
+};
+
+static const unsigned char PROGMEM led_off_icon[] = {
+  0x3C, // 00111100
+  0x42, // 01000010
+  0x42, // 01000010
+  0x42, // 01000010
+  0x3C, // 00111100
+  0x18, // 00011000
+  0x24, // 00100100
+  0x18  // 00011000
+};
+
+// Turn signal icons (8x8 pixels)
+static const unsigned char PROGMEM led_left_turn_icon[] = {
+  0x18, // 00011000
+  0x38, // 00111000
+  0x78, // 01111000
+  0xFF, // 11111111
+  0x78, // 01111000
+  0x38, // 00111000
+  0x18, // 00011000
+  0x00  // 00000000
+};
+
+static const unsigned char PROGMEM led_right_turn_icon[] = {
+  0x18, // 00011000
+  0x1C, // 00011100
+  0x1E, // 00011110
+  0xFF, // 11111111
+  0x1E, // 00011110
+  0x1C, // 00011100
+  0x18, // 00011000
+  0x00  // 00000000
 };
 
 // Top bitmap image (73x30 pixels)
@@ -790,6 +868,17 @@ void displayTripComputer() {
         display.drawBitmap(2, 1, bt_connected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
     }
     
+    // Display LED status icon next to Bluetooth icon
+    if (leftTurnSignal) {
+        display.drawBitmap(12, 1, led_left_turn_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (rightTurnSignal) {
+        display.drawBitmap(12, 1, led_right_turn_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (lightsOn || isFlashing) {
+        display.drawBitmap(12, 1, led_on_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else {
+        display.drawBitmap(12, 1, led_off_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    }
+    
     // Display battery percentage in top right corner
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -1020,6 +1109,17 @@ void displayStartupScreen() {
         display.drawBitmap(2, 1, bt_connected_icon, BT_ICON_WIDTH, BT_ICON_HEIGHT, SSD1306_WHITE);
     }
     
+    // Display LED status icon next to Bluetooth icon
+    if (leftTurnSignal) {
+        display.drawBitmap(12, 1, led_left_turn_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (rightTurnSignal) {
+        display.drawBitmap(12, 1, led_right_turn_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else if (lightsOn || isFlashing) {
+        display.drawBitmap(12, 1, led_on_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    } else {
+        display.drawBitmap(12, 1, led_off_icon, LED_ICON_WIDTH, LED_ICON_HEIGHT, SSD1306_WHITE);
+    }
+    
     // Display battery percentage in top right corner
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -1169,6 +1269,136 @@ void readBatteryLevel() {
             Serial.printf("====================\n");
             lastBatteryDebug = currentTime;
         }
+    }
+}
+
+void setIndividualLights(bool leftHead, bool rightHead, bool leftTail, bool rightTail) {
+    digitalWrite(LEFT_HEADLIGHT_PIN, leftHead ? HIGH : LOW);
+    digitalWrite(RIGHT_HEADLIGHT_PIN, rightHead ? HIGH : LOW);
+    digitalWrite(LEFT_TAILLIGHT_PIN, leftTail ? HIGH : LOW);
+    digitalWrite(RIGHT_TAILLIGHT_PIN, rightTail ? HIGH : LOW);
+    
+    // Update state variables
+    leftHeadlightOn = leftHead;
+    rightHeadlightOn = rightHead;
+    leftTaillightOn = leftTail;
+    rightTaillightOn = rightTail;
+}
+
+void setAllLights(bool state) {
+    setIndividualLights(state, state, state, state);
+}
+
+void toggleLights() {
+    lightsOn = !lightsOn;
+    if (lightsOn) {
+        // Turn on all lights
+        setAllLights(true);
+        Serial.println("All lights ON");
+    } else {
+        // Turn off all lights and stop effects
+        setAllLights(false);
+        isFlashing = false;
+        leftTurnSignal = false;
+        rightTurnSignal = false;
+        Serial.println("All lights OFF");
+    }
+}
+
+void startFlashing() {
+    if (!lightsOn) {
+        lightsOn = true; // Ensure lights are considered "on" during flashing
+    }
+    isFlashing = true;
+    leftTurnSignal = false; // Stop turn signals during flashing
+    rightTurnSignal = false;
+    flashStartTime = millis();
+    lastFlashTime = flashStartTime;
+    Serial.println("Headlights flashing started");
+}
+
+void updateSteeringBasedTurnSignals(int16_t steeringValue) {
+    // Only activate turn signals if lights are on and not flashing
+    if (!lightsOn || isFlashing) {
+        leftTurnSignal = false;
+        rightTurnSignal = false;
+        return;
+    }
+    
+    const int TURN_THRESHOLD = 100; // Adjust based on your steering sensitivity
+    
+    if (steeringValue < -TURN_THRESHOLD) {
+        // Turning left
+        leftTurnSignal = true;
+        rightTurnSignal = false;
+    } else if (steeringValue > TURN_THRESHOLD) {
+        // Turning right
+        leftTurnSignal = false;
+        rightTurnSignal = true;
+    } else {
+        // Going straight
+        leftTurnSignal = false;
+        rightTurnSignal = false;
+    }
+}
+
+void updateBrakeLights(uint16_t brakeValue) {
+    // Activate brake lights when brake is pressed above threshold
+    brakeActive = (brakeValue > BRAKE_THRESHOLD);
+    
+    if (brakeActive && lightsOn) {
+        Serial.printf("Brake lights activated (brake: %d)\n", brakeValue);
+    }
+}
+
+void updateLights() {
+    unsigned long currentTime = millis();
+    
+    if (isFlashing) {
+        // Handle headlight flashing
+        if (currentTime - flashStartTime >= flashDuration) {
+            isFlashing = false;
+            // Return to normal light state
+            if (lightsOn) {
+                setAllLights(true);
+            }
+            Serial.println("Headlights flashing ended");
+            return;
+        }
+        
+        // Toggle headlights at flash interval, keep tail lights steady
+        if (currentTime - lastFlashTime >= flashInterval) {
+            static bool flashState = false;
+            flashState = !flashState;
+            setIndividualLights(flashState, flashState, lightsOn, lightsOn);
+            lastFlashTime = currentTime;
+        }
+    } else if (leftTurnSignal || rightTurnSignal) {
+        // Handle turn signal blinking
+        if (currentTime - lastTurnSignalTime >= turnSignalInterval) {
+            static bool turnState = false;
+            turnState = !turnState;
+            
+            bool leftHead = lightsOn;
+            bool rightHead = lightsOn;
+            bool leftTail = lightsOn || brakeActive; // Brake lights always on when braking
+            bool rightTail = lightsOn || brakeActive; // Brake lights always on when braking
+            
+            if (leftTurnSignal) {
+                leftHead = turnState ? true : lightsOn;
+                leftTail = turnState ? true : (lightsOn || brakeActive);
+            }
+            if (rightTurnSignal) {
+                rightHead = turnState ? true : lightsOn;
+                rightTail = turnState ? true : (lightsOn || brakeActive);
+            }
+            
+            setIndividualLights(leftHead, rightHead, leftTail, rightTail);
+            lastTurnSignalTime = currentTime;
+        }
+    } else if (lightsOn || brakeActive) {
+        // Normal operation - lights on or brake lights
+        setIndividualLights(lightsOn, lightsOn, lightsOn || brakeActive, lightsOn || brakeActive);
     }
 }
 
@@ -1338,10 +1568,36 @@ void processGamepad(ControllerPtr ctl) {
     // Handle trip computer navigation first (d-pad left/right/down)
     handleTripComputerNavigation(currentDPad);
     
-    // Battery diagnostics - press UP on d-pad for detailed battery info
+    // LED control - press UP on d-pad to toggle lights, hold UP for flashing
     static bool upPressed = false;
+    static unsigned long upPressStart = 0;
+    static bool upHeld = false;
+    
     if ((currentDPad & upButton) && !upPressed) {
         upPressed = true;
+        upPressStart = millis();
+        upHeld = false;
+    } else if ((currentDPad & upButton) && upPressed) {
+        // Check for long press (hold for flashing)
+        if (!upHeld && (millis() - upPressStart >= 1000)) {
+            upHeld = true;
+            startFlashing();
+        }
+    } else if (!(currentDPad & upButton) && upPressed) {
+        // UP button released
+        if (!upHeld) {
+            // Short press - toggle lights
+            toggleLights();
+        }
+        upPressed = false;
+        upHeld = false;
+    }
+    
+    // Battery diagnostics - press L1 + R1 + Circle for detailed battery info
+    static bool diagPressed = false;
+    bool diagCombo = (currentButtons & l1Button) && (currentButtons & r1Button) && (currentButtons & circleButton);
+    if (diagCombo && !diagPressed) {
+        diagPressed = true;
         Serial.printf("\n=== BATTERY DIAGNOSTIC REPORT ===\n");
         int rawADC = analogRead(BATTERY_PIN);
         float pinVoltage = (rawADC / 4095.0f) * 3.3f;
@@ -1362,8 +1618,8 @@ void processGamepad(ControllerPtr ctl) {
         }
         
         Serial.printf("================================\n\n");
-    } else if (!(currentDPad & upButton)) {
-        upPressed = false;
+    } else if (!diagCombo) {
+        diagPressed = false;
     }
 
     // Debug trigger values
@@ -1403,6 +1659,12 @@ void processGamepad(ControllerPtr ctl) {
     
     // Update steering based on left joystick X-axis
     updateSteering(axisX);
+    
+    // Update turn signals based on steering input
+    updateSteeringBasedTurnSignals(axisX);
+    
+    // Update brake lights based on brake input
+    updateBrakeLights(currentBrake);
     
     // Update motor control based on mode
     if (motorDiagTest) {
@@ -1572,6 +1834,19 @@ void setup() {
     pinMode(INA_R, OUTPUT);
     pinMode(INB_R, OUTPUT);
     
+    // Initialize LED pins (4-pin independent control)
+    pinMode(LEFT_HEADLIGHT_PIN, OUTPUT);
+    pinMode(RIGHT_HEADLIGHT_PIN, OUTPUT);
+    pinMode(LEFT_TAILLIGHT_PIN, OUTPUT);
+    pinMode(RIGHT_TAILLIGHT_PIN, OUTPUT);
+    
+    // Start with all lights off
+    digitalWrite(LEFT_HEADLIGHT_PIN, LOW);
+    digitalWrite(RIGHT_HEADLIGHT_PIN, LOW);
+    digitalWrite(LEFT_TAILLIGHT_PIN, LOW);
+    digitalWrite(RIGHT_TAILLIGHT_PIN, LOW);
+    Serial.println("4-pin LED system initialized");
+    
     // Initialize encoder pins
     pinMode(ENC_L_A, INPUT_PULLUP);
     pinMode(ENC_L_B, INPUT_PULLUP);
@@ -1675,6 +1950,9 @@ void loop() {
     // Process controller updates
     BP32.update();
     processControllers();
+    
+    // Update LED lighting system
+    updateLights();
     
     // Update motor control systems if controller is connected
     if (isControllerConnected) {
